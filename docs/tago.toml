@@ -1,0 +1,10 @@
+title       = "dz"
+baseURL     = "https://dzone-cli.tamnd.com/"
+description = "Browse DZone developer articles"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/dzone-cli"
