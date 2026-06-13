@@ -1,52 +1,201 @@
-// Package dzone is the library behind the dz command line:
-// the HTTP client, request shaping, and the typed data models for dzone.
+// Package dzone is the library behind the dz command: the HTTP client,
+// request shaping, and the typed data models for DZone.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// Data comes from the public RSS feeds at feeds.dzone.com. No API key is
+// required. The client sends a real User-Agent, paces requests, and retries
+// 429/5xx with exponential backoff.
 package dzone
 
 import (
 	"context"
+	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to dzone. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "dz/dev (+https://github.com/tamnd/dzone-cli)"
+// ErrUnknownSection is returned when the section argument does not match any
+// registered feed key.
+var ErrUnknownSection = errors.New("unknown section")
 
-// Client talks to dzone over HTTP.
-type Client struct {
-	HTTP      *http.Client
-	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+// feedEntry maps a section key to its feed path (relative to BaseURL).
+type feedEntry struct {
+	key   string
+	path  string
+	label string
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+// feeds lists all known DZone topic feeds.
+var feeds = []feedEntry{
+	{"home", "/home", "All recent articles"},
+	{"java", "/java", "Java"},
+	{"security", "/security", "Security"},
+	{"microservices", "/microservices", "Microservices"},
+	{"performance", "/performance", "Performance"},
+	{"agile", "/agile", "Agile"},
+	{"big-data", "/big-data", "Big Data"},
+	{"open-source", "/open-source", "Open Source"},
+	{"data", "/data", "Data"},
+	{"iot", "/iot", "Internet of Things"},
+	{"languages", "/languages", "Languages"},
+	{"integration", "/integration", "Integration"},
+}
+
+// Config holds constructor parameters for Client.
+type Config struct {
+	BaseURL   string
+	UserAgent string
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
+}
+
+// DefaultConfig returns sensible production defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   "https://feeds.dzone.com",
+		UserAgent: "dz/dev (+https://github.com/tamnd/dzone-cli)",
+		Rate:      300 * time.Millisecond,
+		Retries:   3,
+		Timeout:   30 * time.Second,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client fetches DZone RSS feeds.
+type Client struct {
+	httpClient *http.Client
+	baseURL    string
+	userAgent  string
+	rate       time.Duration
+	retries    int
+	mu         sync.Mutex
+	last       time.Time
+}
+
+// NewClient returns a Client configured by cfg.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		httpClient: &http.Client{Timeout: cfg.Timeout},
+		baseURL:    strings.TrimRight(cfg.BaseURL, "/"),
+		userAgent:  cfg.UserAgent,
+		rate:       cfg.Rate,
+		retries:    cfg.Retries,
+	}
+}
+
+// Article is the record emitted for each DZone article.
+type Article struct {
+	Rank      int    `json:"rank"`
+	Title     string `json:"title"`
+	Author    string `json:"author"`
+	Published string `json:"published"`
+	Summary   string `json:"summary"`
+	Tags      string `json:"tags"`
+	URL       string `json:"url"`
+}
+
+// Section is the record emitted by the sections command.
+type Section struct {
+	Rank  int    `json:"rank"`
+	Name  string `json:"name"`
+	Label string `json:"label"`
+	URL   string `json:"url"`
+}
+
+// Latest fetches the /home feed and returns up to limit articles ranked by
+// feed order. limit=0 returns all entries.
+func (c *Client) Latest(ctx context.Context, limit int) ([]Article, error) {
+	return c.fetchFeed(ctx, c.baseURL+"/home", limit)
+}
+
+// Feed fetches the topic-specific feed for section and returns up to limit
+// articles. Returns ErrUnknownSection if section is not registered.
+func (c *Client) Feed(ctx context.Context, section string, limit int) ([]Article, error) {
+	fe, ok := feedByKey(section)
+	if !ok {
+		return nil, fmt.Errorf("%w: %q", ErrUnknownSection, section)
+	}
+	return c.fetchFeed(ctx, c.baseURL+fe.path, limit)
+}
+
+// Search fetches the /home feed and returns articles whose title or summary
+// contains query (case-insensitive). At most limit results are returned;
+// limit=0 returns all matches.
+func (c *Client) Search(ctx context.Context, query string, limit int) ([]Article, error) {
+	all, err := c.Latest(ctx, 0)
+	if err != nil {
+		return nil, err
+	}
+	q := strings.ToLower(query)
+	var out []Article
+	for _, a := range all {
+		if strings.Contains(strings.ToLower(a.Title), q) ||
+			strings.Contains(strings.ToLower(a.Summary), q) ||
+			strings.Contains(strings.ToLower(a.Tags), q) {
+			out = append(out, a)
+			if limit > 0 && len(out) >= limit {
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+// Sections returns the static list of registered feed sections.
+// No network request is made.
+func (c *Client) Sections() []Section {
+	out := make([]Section, len(feeds))
+	for i, fe := range feeds {
+		out[i] = Section{
+			Rank:  i + 1,
+			Name:  fe.key,
+			Label: fe.label,
+			URL:   c.baseURL + fe.path,
+		}
+	}
+	return out
+}
+
+// fetchFeed fetches the raw RSS at rawURL and converts it to Articles.
+func (c *Client) fetchFeed(ctx context.Context, rawURL string, limit int) ([]Article, error) {
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	var feed rssFeed
+	if err := xml.Unmarshal(body, &feed); err != nil {
+		return nil, fmt.Errorf("parse feed %s: %w", rawURL, err)
+	}
+	items := feed.Channel.Items
+	if limit > 0 && limit < len(items) {
+		items = items[:limit]
+	}
+	out := make([]Article, len(items))
+	for i, it := range items {
+		out[i] = itemToArticle(it, i+1)
+	}
+	return out, nil
+}
+
+// feedByKey looks up a feed entry by its section key (case-insensitive).
+func feedByKey(key string) (feedEntry, bool) {
+	key = strings.ToLower(strings.TrimSpace(key))
+	for _, fe := range feeds {
+		if fe.key == key {
+			return fe, true
+		}
+	}
+	return feedEntry{}, false
+}
+
+// get fetches a URL with pacing and retries.
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -54,7 +203,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -63,18 +212,19 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.userAgent)
+	req.Header.Set("Accept", "application/xml, application/rss+xml")
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -86,20 +236,20 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	if resp.StatusCode != http.StatusOK {
 		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
-
-	b, err := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return nil, true, err
 	}
 	return b, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
